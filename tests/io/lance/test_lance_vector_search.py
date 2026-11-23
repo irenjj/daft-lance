@@ -95,9 +95,33 @@ def test_nearest_multi_fragment_global_k1(tmp_path_factory) -> None:
     nearest = {"column": "vector", "q": query, "k": 1}
 
     df = daft.read_lance(dataset_path, default_scan_options={"nearest": nearest})
-    result = df.select("id").to_pydict()
+    result = df.select("id", "_distance").to_pydict()
 
     assert result["id"] == [2]
+    assert result["_distance"] == pytest.approx([0.01])
+
+
+def test_nearest_distance_projection(tmp_path_factory) -> None:
+    dataset_path = build_single_fragment_dataset(tmp_path_factory)
+    nearest = {"column": "vector", "q": [1.0, 0.0], "k": 2}
+    df = daft.read_lance(dataset_path, default_scan_options={"nearest": nearest})
+
+    assert df.to_arrow().schema.field("_distance").type == pa.float32()
+    assert df.select("_distance").to_pydict() == {"_distance": [0.0, 1.0]}
+    assert df.select("id").to_pydict() == {"id": [1, 0]}
+    assert df.count_rows() == 2
+    assert daft.read_lance(dataset_path).column_names == ["id", "vector"]
+
+
+def test_nearest_distance_with_fragment_id(tmp_path_factory) -> None:
+    dataset_path = build_multi_fragment_dataset(tmp_path_factory)
+    nearest = {"column": "vector", "q": [0.0, 0.0], "k": 3}
+    df = daft.read_lance(dataset_path, include_fragment_id=True, default_scan_options={"nearest": nearest})
+
+    result = df.select("id", "fragment_id", "_distance").to_pydict()
+    assert result["id"] == [2, 3, 0]
+    assert result["fragment_id"] == [1, 1, 0]
+    assert result["_distance"] == pytest.approx([0.01, 4.0, 10000.0])
 
 
 def test_nearest_global_single_scan_task(tmp_path_factory) -> None:
@@ -255,12 +279,24 @@ def test_nearest_with_prefilter_true(tmp_path_factory) -> None:
         default_scan_options={"nearest": nearest, "prefilter": True},
     )
     filtered = df.where(col("group") == 1)
-    result = filtered.select("id", "group").to_pydict()
+    result = filtered.select("id", "group", "_distance").to_pydict()
 
     # With prefilter=True, Lance should restrict to group==1 before running nearest
     # so the closest row in that group (id=1) is returned.
     assert result["id"] == [1]
     assert result["group"] == [1]
+    assert result["_distance"] == pytest.approx([0.04])
+
+
+@pytest.mark.parametrize("strict_filter_pushdown", [False, True])
+def test_nearest_distance_filter(tmp_path_factory, strict_filter_pushdown) -> None:
+    dataset_path = build_single_fragment_dataset(tmp_path_factory)
+    nearest = {"column": "vector", "q": [1.0, 0.0], "k": 2}
+    with daft.planning_config_ctx(enable_strict_filter_pushdown=strict_filter_pushdown):
+        df = daft.read_lance(dataset_path, default_scan_options={"nearest": nearest})
+        result = df.where(col("_distance") < 0.5).select("id").to_pydict()
+
+    assert result == {"id": [1]}
 
 
 def test_nearest_with_prefilter_false(tmp_path_factory) -> None:

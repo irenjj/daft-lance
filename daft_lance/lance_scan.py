@@ -11,6 +11,7 @@ from daft.context import get_context
 from daft.daft import CountMode, PyExpr, PyPartitionField, PyPushdowns, PyRecordBatch, ScanTask
 from daft.dependencies import pa
 from daft.expressions import Expression
+from daft.expressions.visitor import _ColumnVisitor
 from daft.io.pushdowns import SupportsPushdownFilters
 from daft.io.scan import ScanOperator
 from daft.logical.schema import Schema
@@ -91,16 +92,36 @@ def _lance_table_factory_function(
 
     # If fragment_ids is None, let Lance choose fragments via index; omit the fragments parameter.
     if fragment_ids is None:
+        columns = required_columns
+        append_fragment_id = nearest is not None and include_fragment_id
+        if nearest is not None:
+            # Lance needs an explicit projection for generated scoring columns.
+            if columns is None:
+                columns = ds.schema.names
+                if "_distance" not in columns:
+                    columns.append("_distance")
+            if append_fragment_id:
+                columns = [column for column in columns if column != "fragment_id"]
+        keep_row_address = columns is not None and "_rowaddr" in columns
+
         scanner = ds.scanner(
-            columns=required_columns,
+            columns=columns,
             filter=filter,
             limit=limit,
             nearest=nearest,
+            with_row_address=True if append_fragment_id else None,
+            disable_scoring_autoprojection=True if nearest is not None else None,
             blob_handling="blobs_descriptions",
         )
 
         def _batches() -> Iterator[PyRecordBatch]:
             for rb in scanner.to_batches():
+                if append_fragment_id:
+                    # Lance stores the fragment ID in the high 32 bits of the physical row address.
+                    fragment_id = pa.compute.shift_right(rb.column("_rowaddr"), pa.scalar(32, type=pa.uint64()))
+                    if not keep_row_address:
+                        rb = rb.drop_columns(["_rowaddr"])
+                    rb = rb.append_column("fragment_id", fragment_id.cast(pa.int64()))
                 yield RecordBatch.from_arrow_record_batches([rb], rb.schema)._recordbatch
 
         return _batches()
@@ -166,8 +187,11 @@ class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
         self._remaining_filters: list[PyExpr] | None = None
         self._fragment_group_size = fragment_group_size
         self._include_fragment_id = include_fragment_id
+        self._nearest = self._nearest_default_option()
         self._enable_strict_filter_pushdown = get_context().daft_planning_config.enable_strict_filter_pushdown
         base = self._ds.schema
+        if self._nearest is not None and "_distance" not in base.names:
+            base = base.append(pa.field("_distance", pa.float32()))
         if self._include_fragment_id:
             metadata: dict[bytes | str, bytes | str] | None = (
                 {k: v for k, v in base.metadata.items()} if base.metadata else None
@@ -198,7 +222,7 @@ class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
 
     def supports_count_pushdown(self) -> bool:
         """Returns whether this scan operator supports count pushdown."""
-        return True
+        return self._nearest is None
 
     def supported_count_modes(self) -> list[CountMode]:
         """Returns the count modes supported by this scan operator."""
@@ -219,7 +243,12 @@ class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
 
         for expr in filters:
             try:
-                Expression._from_pyexpr(expr).to_arrow_expr()
+                expression = Expression._from_pyexpr(expr)
+                # Score predicates refer to the output of nearest search, not the input data.
+                if self._nearest is not None and "_distance" in _ColumnVisitor().visit(expression):
+                    remaining.append(expr)
+                    continue
+                expression.to_arrow_expr()
                 pushed.append(expr)
             except NotImplementedError:
                 remaining.append(expr)
@@ -249,11 +278,12 @@ class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
             if self._include_fragment_id:
                 required_columns.append("fragment_id")
 
-        nearest_option = self._nearest_default_option()
+        nearest_option = self._nearest
 
         # Check if there is a count aggregation pushdown
         if (
-            pushdowns.aggregation is not None
+            nearest_option is None
+            and pushdowns.aggregation is not None
             and pushdowns.aggregation_count_mode() is not None
             and pushdowns.aggregation_required_column_names()
             and pushdowns.limit is None
