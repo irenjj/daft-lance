@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import warnings
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, cast
 
 import lance
 
@@ -118,7 +118,8 @@ def _lance_table_factory_function(
             for rb in scanner.to_batches():
                 if append_fragment_id:
                     # Lance stores the fragment ID in the high 32 bits of the physical row address.
-                    fragment_id = pa.compute.shift_right(rb.column("_rowaddr"), pa.scalar(32, type=pa.uint64()))
+                    row_address = cast(pa.UInt64Array, rb.column("_rowaddr"))
+                    fragment_id = pa.compute.shift_right(row_address, pa.scalar(32, type=pa.uint64()))
                     if not keep_row_address:
                         rb = rb.drop_columns(["_rowaddr"])
                     rb = rb.append_column("fragment_id", fragment_id.cast(pa.int64()))
