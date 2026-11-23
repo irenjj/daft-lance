@@ -93,15 +93,18 @@ def _lance_table_factory_function(
     # If fragment_ids is None, let Lance choose fragments via index; omit the fragments parameter.
     if fragment_ids is None:
         columns = required_columns
+        scanner_options: dict[str, Any] = {}
         append_fragment_id = nearest is not None and include_fragment_id
         if nearest is not None:
-            # Lance needs an explicit projection for generated scoring columns.
+            scanner_options["disable_scoring_autoprojection"] = True
+            # With no Daft projection, expose the full nearest scan schema.
             if columns is None:
                 columns = ds.schema.names
                 if "_distance" not in columns:
                     columns.append("_distance")
             if append_fragment_id:
                 columns = [column for column in columns if column != "fragment_id"]
+                scanner_options["with_row_address"] = True
         keep_row_address = columns is not None and "_rowaddr" in columns
 
         scanner = ds.scanner(
@@ -109,9 +112,8 @@ def _lance_table_factory_function(
             filter=filter,
             limit=limit,
             nearest=nearest,
-            with_row_address=True if append_fragment_id else None,
-            disable_scoring_autoprojection=True if nearest is not None else None,
             blob_handling="blobs_descriptions",
+            **scanner_options,
         )
 
         def _batches() -> Iterator[PyRecordBatch]:
@@ -241,12 +243,17 @@ class LanceScanOperator(ScanOperator, SupportsPushdownFilters):
     def push_filters(self, filters: list[PyExpr]) -> tuple[list[PyExpr], list[PyExpr]]:
         pushed = []
         remaining = []
+        post_scan_columns = set()
+        if self._nearest is not None:
+            post_scan_columns.add("_distance")
+            if self._include_fragment_id:
+                post_scan_columns.add("fragment_id")
 
         for expr in filters:
             try:
                 expression = Expression._from_pyexpr(expr)
-                # Score predicates refer to the output of nearest search, not the input data.
-                if self._nearest is not None and "_distance" in _ColumnVisitor().visit(expression):
+                # Daft applies predicates on generated columns after the nearest scan.
+                if post_scan_columns and not post_scan_columns.isdisjoint(_ColumnVisitor().visit(expression)):
                     remaining.append(expr)
                     continue
                 expression.to_arrow_expr()

@@ -14,6 +14,40 @@ pip install 'daft[lance]'
 
 ## Usage
 
+### Vector Search
+
+`read_lance` exposes Lance's `_distance` column as Float32 when `nearest` is
+set. Use `nearest.distance_range` to restrict the search before its Top-K
+cutoff, and sort explicitly when the output needs to be ordered.
+
+```python
+from daft_lance import read_lance
+
+df = read_lance(
+    "data.lance",
+    default_scan_options={
+        "nearest": {
+            "column": "embedding",
+            "q": [0.0, 1.0],
+            "k": 10,
+            "metric": "l2",
+            "distance_range": (None, 0.5),
+        }
+    },
+)
+result = df.select("id", "_distance").sort("_distance")
+```
+
+The example includes distances strictly below `0.5`. The lower bound is
+inclusive, the upper bound is exclusive, and `None` leaves a side unbounded.
+For an inclusive cutoff of `0.5`, pass the next representable Float32 as the
+upper bound, for example `np.nextafter(np.float32(0.5), np.float32(np.inf)).item()`.
+A Daft filter on `_distance` runs on the matches returned by the nearest scan.
+
+Smaller distances rank first. L2 reports squared Euclidean distance, cosine
+reports one minus cosine similarity, dot reports one minus the dot product, and
+Hamming counts differing bits. Thresholds use the chosen metric's units.
+
 ### Compaction
 
 ```python

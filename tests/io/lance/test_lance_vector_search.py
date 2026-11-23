@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import inspect
 import io
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pytest
 
 import daft
 from daft import col
+from daft_lance import merge_columns_df
 from daft_lance.lance_scan import LanceDBScanOperator
 
 
@@ -95,10 +96,9 @@ def test_nearest_multi_fragment_global_k1(tmp_path_factory) -> None:
     nearest = {"column": "vector", "q": query, "k": 1}
 
     df = daft.read_lance(dataset_path, default_scan_options={"nearest": nearest})
-    result = df.select("id", "_distance").to_pydict()
+    result = df.select("id").to_pydict()
 
-    assert result["id"] == [2]
-    assert result["_distance"] == pytest.approx([0.01])
+    assert result == {"id": [2]}
 
 
 def test_nearest_distance_projection(tmp_path_factory) -> None:
@@ -107,8 +107,8 @@ def test_nearest_distance_projection(tmp_path_factory) -> None:
     df = daft.read_lance(dataset_path, default_scan_options={"nearest": nearest})
 
     assert df.to_arrow().schema.field("_distance").type == pa.float32()
-    assert df.select("_distance").to_pydict() == {"_distance": [0.0, 1.0]}
-    assert df.select("id").to_pydict() == {"id": [1, 0]}
+    assert df.select("_distance").sort("_distance").to_pydict() == {"_distance": [0.0, 1.0]}
+    assert df.select("id").sort("id").to_pydict() == {"id": [0, 1]}
     assert df.count_rows() == 2
     assert daft.read_lance(dataset_path).column_names == ["id", "vector"]
 
@@ -118,10 +118,37 @@ def test_nearest_distance_with_fragment_id(tmp_path_factory) -> None:
     nearest = {"column": "vector", "q": [0.0, 0.0], "k": 3}
     df = daft.read_lance(dataset_path, include_fragment_id=True, default_scan_options={"nearest": nearest})
 
-    result = df.select("id", "fragment_id", "_distance").to_pydict()
+    result = df.select("id", "fragment_id", "_distance").sort("_distance").to_pydict()
     assert result["id"] == [2, 3, 0]
     assert result["fragment_id"] == [1, 1, 0]
     assert result["_distance"] == pytest.approx([0.01, 4.0, 10000.0])
+
+
+def test_nearest_filter_fragment_id_after_search(tmp_path_factory) -> None:
+    dataset_path = build_multi_fragment_dataset(tmp_path_factory)
+    nearest = {"column": "vector", "q": [0.0, 0.0], "k": 3}
+    with daft.planning_config_ctx(enable_strict_filter_pushdown=True):
+        df = daft.read_lance(dataset_path, include_fragment_id=True, default_scan_options={"nearest": nearest})
+        result = df.where(col("fragment_id") == 0).select("id").to_pydict()
+
+    assert result == {"id": [0]}
+
+
+def test_nearest_merge_distances_by_row_address(tmp_path_factory) -> None:
+    dataset_path = build_multi_fragment_dataset(tmp_path_factory)
+    nearest = {"column": "vector", "q": [0.0, 0.0], "k": 3}
+    df = daft.read_lance(
+        dataset_path,
+        include_fragment_id=True,
+        default_scan_options={"nearest": nearest, "with_row_address": True},
+    )
+    scores = df.select("fragment_id", "_rowaddr", col("_distance").alias("query_distance"))
+    merge_columns_df(scores, dataset_path)
+
+    table = lance.dataset(dataset_path).to_table(columns=["id", "query_distance"]).sort_by("id")
+    result = table["query_distance"].to_pylist()
+    assert result[1] is None
+    assert [result[0], *result[2:]] == pytest.approx([10000.0, 0.01, 4.0])
 
 
 def test_nearest_global_single_scan_task(tmp_path_factory) -> None:
@@ -230,24 +257,6 @@ def test_nearest_with_projection(tmp_path_factory) -> None:
 
 
 def test_nearest_distance_range(tmp_path_factory) -> None:
-    # distance_range is only available in newer versions of Lance. Skip the test
-    # if the installed version does not support it to keep the suite compatible
-    # with older environments.
-    import importlib
-
-    try:
-        lance_dataset_module = importlib.import_module("lance.dataset")
-    except Exception:
-        pytest.skip("lance.dataset module not available; skipping distance_range test")
-
-    ScannerBuilder = getattr(lance_dataset_module, "ScannerBuilder", None)
-    if ScannerBuilder is None:
-        pytest.skip("ScannerBuilder not available; distance_range not supported")
-
-    nearest_sig = inspect.signature(ScannerBuilder.nearest)
-    if "distance_range" not in nearest_sig.parameters:
-        pytest.skip("distance_range is not supported by the installed lance version")
-
     dataset_path = build_multi_fragment_dataset(tmp_path_factory)
 
     query = pa.array([0.0, 0.0], type=pa.float32())
@@ -263,6 +272,35 @@ def test_nearest_distance_range(tmp_path_factory) -> None:
 
     # Only id=2 lies within the requested distance range of the origin.
     assert ids == [2]
+
+
+@pytest.mark.parametrize(
+    ("upper", "expected"),
+    [
+        (10000.0, {"id": [3], "_distance": [4.0]}),
+        (
+            np.nextafter(np.float32(10000.0), np.float32(np.inf)).item(),
+            {"id": [3, 0], "_distance": [4.0, 10000.0]},
+        ),
+    ],
+)
+def test_nearest_distance_range_before_top_k(tmp_path_factory, upper, expected) -> None:
+    dataset_path = build_multi_fragment_dataset(tmp_path_factory)
+    nearest = {"column": "vector", "q": [0.0, 0.0], "k": 2, "use_index": False, "distance_range": (4.0, upper)}
+    df = daft.read_lance(dataset_path, default_scan_options={"nearest": nearest})
+
+    assert df.select("id", "_distance").sort("_distance").to_pydict() == expected
+
+
+def test_nearest_hamming_distance_is_float32(tmp_path) -> None:
+    binary_vectors = pa.array([[0], [1], [3], [255]], type=pa.list_(pa.uint8(), 1))
+    lance.write_dataset(pa.table({"vector": binary_vectors}), tmp_path)
+    nearest = {"column": "vector", "q": pa.array([0], type=pa.uint8()), "k": 3, "metric": "hamming"}
+    df = daft.read_lance(tmp_path, default_scan_options={"nearest": nearest})
+
+    result = df.select("_distance").sort("_distance").to_arrow()
+    assert result.schema.field("_distance").type == pa.float32()
+    assert result["_distance"].to_pylist() == [0.0, 1.0, 2.0]
 
 
 def test_nearest_with_prefilter_true(tmp_path_factory) -> None:
