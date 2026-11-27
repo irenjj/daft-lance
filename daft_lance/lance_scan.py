@@ -105,6 +105,9 @@ def _lance_table_factory_function(
             if append_fragment_id:
                 columns = [column for column in columns if column != "fragment_id"]
                 scanner_options["with_row_address"] = True
+            elif not columns:
+                # Daft needs a column to preserve row counts for literal-only projections.
+                columns = ["_distance"]
         keep_row_address = columns is not None and "_rowaddr" in columns
 
         scanner = ds.scanner(

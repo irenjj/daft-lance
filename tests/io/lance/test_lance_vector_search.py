@@ -113,6 +113,27 @@ def test_nearest_distance_projection(tmp_path_factory) -> None:
     assert daft.read_lance(dataset_path).column_names == ["id", "vector"]
 
 
+@pytest.mark.parametrize("include_fragment_id", [False, True])
+@pytest.mark.parametrize("with_row_address", [False, True])
+@pytest.mark.parametrize(("distance_range", "expected"), [((0.0, 2.0), [1, 1]), ((3.0, 4.0), [])])
+def test_nearest_constant_projection(
+    tmp_path_factory: pytest.TempPathFactory,
+    include_fragment_id: bool,
+    with_row_address: bool,
+    distance_range: tuple[float, float],
+    expected: list[int],
+) -> None:
+    dataset_path = build_single_fragment_dataset(tmp_path_factory)
+    nearest = {"column": "vector", "q": [1.0, 0.0], "k": 2, "distance_range": distance_range}
+    df = daft.read_lance(
+        dataset_path,
+        include_fragment_id=include_fragment_id,
+        default_scan_options={"nearest": nearest, "with_row_address": with_row_address},
+    )
+
+    assert df.select(daft.lit(1).alias("one")).to_pydict() == {"one": expected}
+
+
 def test_nearest_distance_with_fragment_id(tmp_path_factory) -> None:
     dataset_path = build_multi_fragment_dataset(tmp_path_factory)
     nearest = {"column": "vector", "q": [0.0, 0.0], "k": 3}
